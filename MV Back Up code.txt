@@ -1,0 +1,382 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.interpolate import griddata
+import matplotlib.tri as tri
+import math
+from scipy.special import kv 
+from scipy.special import kve
+from scipy import integrate
+from joblib import Parallel, delayed
+from scipy.integrate import quad
+from numba import njit, prange
+from scipy.interpolate import RegularGridInterpolator
+from scipy.integrate import dblquad
+from scipy.interpolate import CubicSpline
+
+DTT = open('MV Dipole table.txt','r')
+with open("MV Dipole table.txt", "r") as file:
+    lines = file.readlines()
+print(lines)
+
+MVA = open('redx-2009-parsed-small-x(2).txt','r')
+with open("redx-2009-parsed-small-x(2).txt", "r") as file:
+    linesR = file.readlines()
+print(linesR)
+
+DIPOLEdata = np.loadtxt('MV Dipole table.txt', skiprows=1)
+
+# Split into separate arrays
+Y = DIPOLEdata[:, 0]
+R = DIPOLEdata[:, 1]
+N = DIPOLEdata[:, 2]
+# Build Y_vals, R_vals_dip, N_grid as before
+Y_vals = np.unique(Y)
+R_vals_dip = np.unique(R)
+
+# Build the 2D dipole amplitude grid N(Y, R)
+NY = len(Y_vals)
+NR = len(R_vals_dip)
+
+N_grid = np.zeros((NY, NR))
+
+for i in range(len(N)):
+    iy = np.searchsorted(Y_vals, Y[i])
+    ir = np.searchsorted(R_vals_dip, R[i])
+    N_grid[iy, ir] = N[i]
+
+
+# Convert Y -> x
+x_vals = 0.01 * np.exp(-Y_vals)
+
+# IMPORTANT: ensure x is increasing for searchsorted
+if x_vals[0] > x_vals[-1]:
+    x_vals = x_vals[::-1]
+    N_grid = N_grid[::-1, :]
+
+logx_vals = np.log(x_vals)
+
+# Make contiguous (Numba requirement)
+x_vals = np.ascontiguousarray(x_vals, dtype=np.float64)
+logx_vals = np.ascontiguousarray(logx_vals, dtype=np.float64)
+R_vals_dip = np.ascontiguousarray(R_vals_dip, dtype=np.float64)
+logR_vals_dip = np.ascontiguousarray(np.log(R_vals_dip), dtype=np.float64)
+N_grid = np.ascontiguousarray(N_grid, dtype=np.float64)
+
+# -------------------------------------------------
+# Cubic splines in log(R) for each x-slice
+# -------------------------------------------------
+spline_coeffs = np.zeros(
+    (len(logx_vals),
+     len(logR_vals_dip)-1,
+     4)
+)
+
+for ix in range(len(logx_vals)):
+    cs = CubicSpline(
+        logR_vals_dip,
+        N_grid[ix, :],
+        bc_type='natural'
+    )
+
+    spline_coeffs[ix] = cs.c.T
+
+spline_coeffs = np.ascontiguousarray(
+    spline_coeffs,
+    dtype=np.float64
+)
+
+@njit(fastmath=True)
+def spline_eval_R(logR, coeffs_row, logR_grid):
+
+    if logR <= logR_grid[0]:
+        ir = 0
+    elif logR >= logR_grid[-1]:
+        ir = len(logR_grid) - 2
+    else:
+        ir = np.searchsorted(logR_grid, logR) - 1
+
+    dx = logR - logR_grid[ir]
+
+    c0 = coeffs_row[ir,0]
+    c1 = coeffs_row[ir,1]
+    c2 = coeffs_row[ir,2]
+    c3 = coeffs_row[ir,3]
+
+    return ((c0*dx + c1)*dx + c2)*dx + c3
+
+#----------------- Interpolation-----------------------------
+@njit(fastmath=True)
+def dipole_amplitude_x(x, R, logx_vals, logR_vals, N_grid, spline_coeffs):
+    logx = np.log(x)
+    logR = np.log(R)
+
+    # ----------------------------
+    # linear interpolation in log(x)
+    # ----------------------------
+    if logx <= logx_vals[0]:
+        ix = 0
+    elif logx >= logx_vals[-1]:
+        ix = len(logx_vals) - 2
+    else:
+        ix = np.searchsorted(logx_vals, logx) - 1
+
+    logx1 = logx_vals[ix]
+    logx2 = logx_vals[ix + 1]
+
+    tx = (logx - logx1)/(logx2 - logx1)
+
+    N1 = spline_eval_R(
+        logR,
+        spline_coeffs[ix],
+        logR_vals
+    )
+
+    N2 = spline_eval_R(
+        logR,
+        spline_coeffs[ix + 1],
+        logR_vals
+    )
+
+    # linear interpolation in x
+    return (1.0 - tx)*N1 + tx*N2
+
+def dipole_amp_interp(x, r):
+    return dipole_amplitude_x(
+        x,
+        r,
+        logx_vals,
+        logR_vals_dip,
+        N_grid,
+        spline_coeffs
+    )
+
+DISdata = np.loadtxt('redx-2009-parsed-small-x(2).txt', skiprows=1)
+
+# Split into separate arrays
+roots_DIS = DISdata[:,0]
+s_DIS = roots_DIS**2
+Q2_DIS= DISdata[:, 1]
+x_DIS = DISdata[:, 2]
+sigma_r_DIS = DISdata[:, 3]
+rel_err_sigma_r_DIS = DISdata[:, 4]
+
+lengthQ2_DIS = len(Q2_DIS)
+lengthx_DIS = len(x_DIS)
+
+PiRp2MV = 18.81 * 2.56819 
+ef2 = (2/3)**2 + (-1/3)**2 + (-1/3)**2
+mf = 0.140
+Alpha_em = 1 / 137
+nc = 3
+
+def photonWFSquared(z, r, Q2, pol):
+
+    eps2 = z*(1-z)*Q2 + mf**2
+    arg = np.sqrt(eps2)*r
+
+    K0 = np.exp(-arg)*kve(0,arg)
+    K1 = np.exp(-arg)*kve(1,arg)
+
+    coeff = 2*nc*Alpha_em*ef2/(4*np.pi**2)
+
+    if pol == 0:
+
+        return (
+            coeff
+            * 4*Q2*z**2*(1-z)**2
+            * K0**2
+        )
+
+    if pol == 1:
+
+        return (
+            coeff
+            * (
+                (z**2+(1-z)**2)
+                * eps2
+                * K1**2
+                +
+                mf**2*K0**2
+            )
+        )
+
+def SigmaLDP_dblquad(x_val, Q2_val):
+
+    def integrand(u, z):
+
+        r = np.exp(u)
+
+        Nval = dipole_amp_interp(x_val, r)
+
+        return (
+            r
+            * photonWFSquared(z, r, Q2_val, 0)
+            * Nval
+            * r
+        )
+
+    val, err = dblquad(
+        integrand,
+        0.0,
+        0.5,
+        lambda z: np.log(1e-6),
+        lambda z: np.log(100.0),
+        epsabs=1e-6,
+        epsrel=1e-2
+    )
+
+    return 8*np.pi*PiRp2MV*val
+
+def SigmaTDP_dblquad(x_val, Q2_val):
+
+    def integrand(u, z):
+
+        # transform variable
+        r = np.exp(u)
+
+        Nval = dipole_amp_interp(x_val, r)
+
+        return (
+            r
+            * photonWFSquared(z, r, Q2_val, 1)
+            * Nval
+            * r          # Jacobian dr = r du
+        )
+
+    val, err = dblquad(
+        integrand,
+        0.0,
+        0.5,
+        lambda z: np.log(1e-6),
+        lambda z: np.log(100.0),
+        epsabs=1e-6,
+        epsrel=1e-2
+    )
+
+    return 8*np.pi*PiRp2MV*val
+
+def FLDP(x,Q2):
+
+    sigmaL = SigmaLDP_dblquad(x,Q2)
+
+    return (
+        Q2
+        /(4*np.pi**2*Alpha_em)
+        * sigmaL
+    )
+
+def F2DP(x,Q2):
+
+    sigmaL = SigmaLDP_dblquad(x,Q2)
+    sigmaT = SigmaTDP_dblquad(x,Q2)
+
+    return (
+        Q2
+        /(4*np.pi**2*Alpha_em)
+        *(sigmaL+sigmaT)
+    )
+
+def SigmaRDP(x,Q2,s):
+
+    sigmaL = SigmaLDP_dblquad(x,Q2)
+    sigmaT = SigmaTDP_dblquad(x,Q2)
+
+    yval = Q2/(x*s)
+
+    return (
+        Q2/(4*np.pi**2*Alpha_em)
+        *(
+            sigmaT
+            +
+            (2*(1-yval))
+            /(1+(1-yval)**2)
+            *sigmaL
+        )
+    )
+
+def compute_SigmaRDP_points():
+
+    SigmaR_data = np.zeros(len(x_DIS))
+
+    for i in range(len(x_DIS)):
+
+        SigmaR_data[i] = SigmaRDP(
+            x_DIS[i],
+            Q2_DIS[i],
+            s_DIS[i]
+        )
+
+        #print(i+1, "/", len(x_DIS))
+
+    return SigmaR_data
+
+
+def compute_FL_grid():
+
+    FL_data = np.zeros((len(Q2_DIS), len(x_DIS)))
+
+    for i, Q2_val in enumerate(Q2_DIS):
+
+        results = Parallel(n_jobs=-1)(
+            delayed(FLDP)(
+                x_val,
+                Q2_val
+            )
+            for x_val in x_DIS
+        )
+
+        FL_data[i,:] = results
+
+    return FL_data
+
+def compute_F2_grid():
+
+    F2_data = np.zeros((len(Q2_DIS), len(x_DIS)))
+
+    for i, Q2_val in enumerate(Q2_DIS):
+
+        results = Parallel(n_jobs=-1)(
+            delayed(F2DP)(
+                x_val,
+                Q2_val
+            )
+            for x_val in x_DIS
+        )
+
+        F2_data[i,:] = results
+
+    return F2_data
+
+def compute_SigmaR_grid():
+
+    SigmaR_data = np.zeros((len(Q2_DIS), len(x_DIS)))
+
+    for i, Q2_val in enumerate(Q2_DIS):
+
+        s_val = s_DIS[i]
+
+        results = Parallel(n_jobs=-1)(
+            delayed(SigmaRDP)(
+                x_val,
+                Q2_val,
+                s_val
+            )
+            for x_val in x_DIS
+        )
+
+        SigmaR_data[i,:] = results
+
+    return SigmaR_data
+
+theory = compute_SigmaRDP_points()
+data   = sigma_r_DIS
+
+abs_err = data * rel_err_sigma_r_DIS / 100
+
+chi2_points = ((theory - data)/abs_err)**2
+
+chi2_total = np.sum(chi2_points)
+
+print("N points =", len(data))
+print("chi2 =", chi2_total)
+print("chi2/N =", chi2_total/len(data))
