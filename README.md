@@ -8,7 +8,7 @@ The objective of this project is to reproduce the reduced $\chi^2$ values report
 
 - Numerical implementations of the **MV** and **MVe** dipole models.
 - Backup versions of both models in `.txt` format.
-- Apendix GBW model.
+- Appendix GBW model.
 - An earlier implementation based on a precomputed Bessel function approach.
 - Numerical routines for calculating:
   - the longitudinal structure function, $F_L$,
